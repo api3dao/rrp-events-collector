@@ -1,0 +1,44 @@
+service: rrp-collector
+
+plugins:
+  - serverless-plugin-typescript
+
+variablesResolutionMode: 20210326
+
+package:
+  patterns:
+    - ./config/config.json
+
+provider:
+  name: aws
+  region: us-east-1
+  stage: production
+  runtime: nodejs16.x
+  architecture: arm64
+  lambdaHashingVersion: 20201221
+  logRetentionInDays: 7
+  apiGateway:
+    restApiId: 'something'
+    restApiRootResourceId: 'something'
+    apiKeys:
+      - x-api-key: aCaCAXMq59sc7S4BWGRgBXDNPYBjVMYp
+  vpc:
+    securityGroupIds:
+      - sg-00000000000000000
+    subnetIds:
+      - subnet-00000000
+  environment:
+    OPSGENIE_API_KEY: ''
+    POSTGRES_USER: ''
+    POSTGRES_PASSWORD: ''
+    POSTGRES_DATABASE: ''
+    POSTGRES_HOST: ''
+    DEBUG: true
+
+functions:
+  rrp_collection_handler:
+    handler: src/handlers.rrpCollectionHandler
+    timeout: 120
+    memorySize: 256
+    events:
+      - schedule: rate(3 minutes)

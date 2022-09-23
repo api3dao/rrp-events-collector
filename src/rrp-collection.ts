@@ -1,15 +1,47 @@
 import { ethers } from 'ethers';
-import { parseAirnodeRrpLog } from '@api3/airnode-node/dist/src/evm/requests/event-logs';
-import { EVMEventLog } from '@api3/airnode-node/dist/src/types';
 import { Client } from 'pg';
 import * as importedDeployments from '@api3/airnode-protocol/dist/deployments/references.json';
+import { AirnodeRrpV0Factory } from '@api3/airnode-protocol';
 import { go } from '@api3/promise-utils';
-import { logging } from '@api3/operations-utilities';
+import {
+  logging,
+  TelemetryChainConfig,
+  sendToOpsGenieLowLevel,
+  closeOpsGenieAlertWithAlias,
+  evm,
+} from '@api3/operations-utilities';
 import { Config } from './types';
 
-type UniqueEventsWithBlockTimes = Record<string, { events: number; time: number }>;
+export type EventData = ethers.providers.Log & { parsedLog: ethers.utils.LogDescription };
 
-export const ANU_AIRNODE_ADDRESS = '0x9d3C147cA16DB954873A498e0af5852AB39139f2';
+export interface TransactionData {
+  gasUsed: ethers.BigNumber;
+  effectiveGasPrice: ethers.BigNumber;
+  type: number;
+  from: string;
+}
+
+interface Event {
+  time: number;
+  chainId: number;
+  blockNumber: number;
+  transactionHash: string;
+  logIndex: number;
+  transactionData: TransactionData;
+  eventName: string;
+  eventData: EventData;
+}
+
+type CompoundTransactionData = Omit<ethers.providers.TransactionResponse, 'wait' | 'confirmations'> &
+  ethers.providers.TransactionReceipt;
+
+interface CompoundTransaction {
+  time: number;
+  chainId: number;
+  blockNumber: number;
+  transactionHash: string;
+  transactionData: CompoundTransactionData;
+}
 
 export interface Deployments {
   chainNames: Record<string, string>;
@@ -21,6 +53,12 @@ export interface Deployments {
 const deployments = importedDeployments as Deployments;
 const { AirnodeRrpV0 } = deployments;
 
+export function parseAirnodeRrpLog(log: ethers.providers.Log) {
+  const airnodeRrpInterface = new ethers.utils.Interface(AirnodeRrpV0Factory.abi);
+  const parsedLog = airnodeRrpInterface.parseLog(log);
+  return parsedLog;
+}
+
 /**
  * Collects request counts on a per-block basis from configured chains and inserts the results into the database
  *
@@ -28,180 +66,261 @@ const { AirnodeRrpV0 } = deployments;
  * @param db the target database
  */
 export const runRrpCollectionTask = async (config: Config, db?: Client) => {
+  // Get chain configs based on deployments
+  const chainConfig = Object.keys(deployments.chainNames).reduce(
+    (acc: Record<string, TelemetryChainConfig>, chainId) => {
+      if (config.chains[chainId]) return { ...acc, [chainId]: config.chains[chainId] };
+      return acc;
+    },
+    {}
+  );
+
   if (!db) {
     console.log('Database not initialized - quitting.');
     process.exit(0);
   }
 
   // For development: if you need to recreate the tables, uncomment this command
-  // await db.query(`DROP TABLE IF EXISTS qrng_requests_per_block; DROP TABLE IF EXISTS qrng_fulfilments_per_block;`);
+  // await db.query(`DROP TABLE IF EXISTS rrp_events; DROP TABLE IF EXISTS rrp_transactions; DROP TABLE IF EXISTS rrp_last_block_per_chain;`);
 
   // This won't do anything if the table exists
   // This is like a mini database migration
   await db.query(
     `
-CREATE TABLE IF NOT EXISTS qrng_requests_per_block (
-            "time" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "events" bigint,
-            "chain" bigint,
-            "block" bigint,
-            UNIQUE (chain, block)
-);`
+  CREATE TABLE IF NOT EXISTS rrp_events (
+              "time" TIMESTAMPTZ NOT NULL,
+              "chain" bigint,
+              "block" bigint,
+              "transaction_hash" TEXT,
+              "log_index" bigint,
+              "event_name" TEXT,
+              "transaction_data" JSONB,
+              "event_data" JSONB,
+              PRIMARY KEY(transaction_hash, log_index)
+  );
+  CREATE INDEX IF NOT EXISTS rrp_events_event_name_idx ON rrp_events (event_name);
+  CREATE INDEX IF NOT EXISTS rrp_events_time_idx ON rrp_events (time);`
   );
 
   await db.query(
     `
-CREATE TABLE IF NOT EXISTS qrng_fulfilments_per_block (
-            "time" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "events" bigint,
-            "chain" bigint,
-            "block" bigint,
-            UNIQUE (chain, block)
-);`
+  CREATE TABLE IF NOT EXISTS rrp_transactions (
+              "time" TIMESTAMPTZ NOT NULL,
+              "chain" bigint,
+              "block" bigint,
+              "transaction_hash" TEXT PRIMARY KEY,
+              "transaction_data" JSONB
+  );
+  CREATE INDEX IF NOT EXISTS rrp_transactions_time_idx ON rrp_transactions (time);`
+  );
+
+  // This table is used to keep track of the last queried block from which the next run should start. This ensures that the collector doesn't get stuck if there is a period longer than the defined maxBlock during which no events are found.
+  await db.query(
+    `
+  CREATE TABLE IF NOT EXISTS rrp_last_block_per_chain (
+              "time" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              "chain" bigint,
+              "block" bigint,
+              UNIQUE (chain, block)
+  );`
   );
 
   // For development: if you just want to empty the existing tables, uncomment this command
-  // await db.query(`DELETE FROM qrng_requests_per_block; DELETE FROM qrng_fulfilments_per_block`);
+  // await db.query(`DELETE FROM rrp_events; DELETE FROM rrp_transactions; DELETE FROM rrp_last_block_per_chain;`);
   // await db.query(`GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO grafanareader;`);
 
   await Promise.allSettled(
-    Object.entries(config.chains).map(async ([key, value]) => {
+    Object.entries(chainConfig).map(async ([key, value]) => {
       try {
         const chainId = parseInt(key);
 
-        // Get the last block on a per-chain basis
-        const maxBlockFromRequests =
-          parseInt(
-            (await db.query(`SELECT MAX(block) FROM qrng_requests_per_block WHERE chain = $1;`, [chainId.toString()]))
-              .rows[0].max ?? 0
-          ) + 1;
+        // Get the last queried block on a per-chain basis
+        const lastQueriedBlock = parseInt(
+          (await db.query(`SELECT block FROM rrp_last_block_per_chain WHERE chain = $1;`, [chainId.toString()])).rows[0]
+            ?.block ?? 1
+        );
 
         const provider = new ethers.providers.StaticJsonRpcProvider(value.rpc, { chainId, name: key });
 
-        const rawBlockResult = await go(() => provider.getBlockNumber(), {
+        const blockResult = await go(() => provider.getBlockNumber(), {
           attemptTimeoutMs: 10_000,
-          retries: 5,
+          retries: 3,
         });
-
-        if (!rawBlockResult.success) {
-          logging.logTrace(
-            'Block number retrieval failure',
-            'ERROR',
-            JSON.stringify(
-              {
-                error: rawBlockResult.error,
-                rpc_url: value.rpc,
-                chainId,
-                name: key,
-              },
-              null,
-              2
-            )
-          );
+        if (!blockResult.success) {
+          logging.logTrace('Failed to get block number', 'ERROR', blockResult.error);
           return;
         }
 
-        const rawBlock = rawBlockResult.data;
+        const rawBlock = blockResult.data;
 
         // The maximum number of blocks to query
         // Public RPCs usually have more severe limitations than, say, Alchemy.
         const maxBlock = 2_000;
+        const fromBlock = lastQueriedBlock + 1;
+        const toBlock = rawBlock - fromBlock > maxBlock ? fromBlock + maxBlock : rawBlock;
 
-        // This seems to be a common restriction of getLogs
-        const fromBlock = rawBlock - maxBlockFromRequests > maxBlock ? rawBlock - maxBlock : maxBlockFromRequests;
-
-        const rawLogsResult = await go(
+        const getLogsResult = await go(
           () =>
             provider.getLogs({
               fromBlock,
-              toBlock: 'latest',
+              toBlock,
               address: AirnodeRrpV0[key],
-              topics: [null, ethers.utils.hexZeroPad(ANU_AIRNODE_ADDRESS, 32)],
             }),
           // Timeouts can be quite long for the initial query
           { attemptTimeoutMs: 60_000, retries: 2 }
         );
-        if (!rawLogsResult.success) {
-          // TODO better error handling
-          const err = rawLogsResult.error;
-          logging.log('Unable to retrieve block in the RRP events collector', 'ERROR', `${err.message}\n${err.stack}`);
+        if (!getLogsResult.success) {
+          const { error } = getLogsResult;
+
+          await sendToOpsGenieLowLevel(
+            {
+              priority: 'P3',
+              alias: `block-retrieval-rrp-collector-error`,
+              message: `Unable to retrieve block in the rrp events collector on ${evm.resolveChainName(
+                chainId.toString()
+              )}`,
+              description: `${error.message}\n${error.stack}`,
+            },
+            config.opsGenieConfig
+          );
+
           return;
         }
+        await closeOpsGenieAlertWithAlias(`block-retrieval-rrp-collector-error`, config.opsGenieConfig);
 
-        const rawLogs = rawLogsResult.data;
-
-        const logsWithBlocks = rawLogs.map((log: any) => ({
-          address: log.address,
-          blockNumber: log.blockNumber,
-          transactionHash: log.transactionHash,
-          parsedLog: parseAirnodeRrpLog(log),
-        })) as EVMEventLog[];
-
-        const filteredLogsWithBlocksFulfilments = logsWithBlocks.filter(
-          (log) => log.parsedLog.eventFragment.name === 'FulfilledRequest'
-        );
-
-        const uniqueReducerFunction = (prev: Record<string, number>, curr: any) => {
-          const thisValue = prev[curr.blockNumber];
-          if (thisValue) {
+        const logsWithBlocks: Omit<Event, 'transactionData' | 'time'>[] = getLogsResult.data.map(
+          (log: ethers.providers.Log) => {
+            const parsedLog = parseAirnodeRrpLog(log);
             return {
-              ...prev,
-              [curr.blockNumber.toString()]: thisValue + 1,
+              chainId,
+              blockNumber: log.blockNumber,
+              transactionHash: log.transactionHash,
+              logIndex: log.logIndex,
+              eventName: parsedLog.name,
+              eventData: { ...log, parsedLog },
             };
           }
-
-          return {
-            ...prev,
-            [curr.blockNumber.toString()]: 1,
-          };
-        };
-
-        const uniqueFulfilments = filteredLogsWithBlocksFulfilments.reduce(
-          uniqueReducerFunction,
-          {} as Record<string, number>
         );
 
-        // Filters for ANU's endpoints
-        const filteredLogsWithBlocksRequests = logsWithBlocks.filter(
-          (log) =>
-            log.parsedLog.args[5] === '0xfb6d017bb87991b7495f563db3c8cf59ff87b09781947bb1e417006ad7f55a78' ||
-            log.parsedLog.args[5] === '0x27cc2713e7f968e4e86ed274a051a5c8aaee9cca66946f23af6f29ecea9704c3'
+        // Collect full transaction details (i.e. ethers transactionReceipt and transactionResponse)
+        // for each RRP event
+        const compoundTransactions: CompoundTransaction[] = [];
+
+        const promisedRrpEvents = await Promise.allSettled(
+          logsWithBlocks.map(async (logWithBlock) => {
+            // Fetch both block and transaction data from the provider to ensure
+            // all required data for the current log is retrieved.
+            // Throw an error if fetching either fails even after all retries.
+            const logsWithBlocksResult = await go(() => provider.getBlockWithTransactions(logWithBlock.blockNumber), {
+              retries: 3,
+              attemptTimeoutMs: 20_000,
+            });
+
+            if (!logsWithBlocksResult.success) {
+              console.trace(logsWithBlocksResult.error);
+              throw new Error(
+                `Unable to get block (${logWithBlock.blockNumber}/${
+                  logWithBlock.transactionHash
+                }) in the rrp events collector on ${evm.resolveChainName(chainId.toString())}`
+              );
+            }
+
+            const block = logsWithBlocksResult.data;
+            if (!block) {
+              // TODO improve error message
+              console.trace('Empty block');
+              return;
+            }
+
+            const transactionReceiptResult = await go(
+              () => provider.getTransactionReceipt(logWithBlock.transactionHash),
+              {
+                retries: 3,
+                attemptTimeoutMs: 20_000,
+              }
+            );
+
+            if (!transactionReceiptResult.success) {
+              console.trace(transactionReceiptResult.error);
+              throw new Error(
+                `Unable to get transaction (${logWithBlock.blockNumber}/${
+                  logWithBlock.transactionHash
+                }) in the rrp events collector on ${evm.resolveChainName(chainId.toString())}`
+              );
+            }
+
+            const transactionReceipt = transactionReceiptResult.data;
+
+            const transaction = block.transactions.find(
+              (tx: ethers.providers.TransactionResponse) => tx.hash === logWithBlock.transactionHash
+            );
+
+            if (!transaction) {
+              // This should never happen
+              console.trace('Unable to find event log transaction match among the block transactions');
+              return;
+            }
+
+            const compoundTransaction = {
+              time: block.timestamp,
+              chainId: logWithBlock.chainId,
+              blockNumber: logWithBlock.blockNumber,
+              transactionHash: logWithBlock.transactionHash,
+              transactionData: { ...transaction, ...transactionReceipt },
+            };
+            compoundTransactions.push(compoundTransaction);
+
+            const { gasUsed, effectiveGasPrice, type, from } = transactionReceipt;
+
+            return {
+              ...logWithBlock,
+              time: block.timestamp,
+              // At least RSK and BSC do not have effectiveGasPrice in the transactionReceipt so use transaction gasPrice instead
+              transactionData: {
+                gasUsed,
+                effectiveGasPrice: effectiveGasPrice || transaction.gasPrice,
+                type,
+                from,
+              },
+            };
+          })
         );
+        const isFulfilled = <T>(input: PromiseSettledResult<T>): input is PromiseFulfilledResult<T> =>
+          input.status === 'fulfilled';
 
-        const uniqueRequests = filteredLogsWithBlocksRequests.reduce(
-          uniqueReducerFunction,
-          {} as Record<string, number>
-        );
-
-        const uniqueRequestsWithBlockTimes = Object.fromEntries(
-          await Promise.all(
-            Object.entries(uniqueRequests).map(async ([key, value]) => {
-              const block = await provider.getBlock(parseInt(key));
-              return [key, { events: value, time: block.timestamp }];
-            })
-          )
-        ) as UniqueEventsWithBlockTimes;
-
-        // This re-uses timestamps for blocks retrieved for requests
-        const uniqueFulfilmentsWithBlockTimes = Object.fromEntries(
-          await Promise.all(
-            Object.entries(uniqueFulfilments).map(async ([key, value]) => {
-              const blockTime =
-                uniqueRequestsWithBlockTimes[key]?.time ?? (await provider.getBlock(parseInt(key))).timestamp;
-              return [key, { events: value, time: blockTime }];
-            })
-          )
-        ) as UniqueEventsWithBlockTimes;
+        const rrpEvents = promisedRrpEvents.filter(isFulfilled).map((promise) => promise.value as Event);
+        console.log('rrpEvents', rrpEvents);
 
         await Promise.all([
-          sendEventsToDatabase(db, 'fulfilments', chainId, uniqueFulfilmentsWithBlockTimes),
-          sendEventsToDatabase(db, 'requests', chainId, uniqueRequestsWithBlockTimes),
+          sendEventsToDatabase(db, 'events', rrpEvents, config),
+          sendEventsToDatabase(db, 'transactions', compoundTransactions, config),
         ]);
 
+        // Save the last queried block number after succesfully inserting the event data
+        await db.query(
+          `
+          UPDATE rrp_last_block_per_chain
+          SET time = NOW(),
+              block = $1
+          WHERE chain = $2;`,
+          [toBlock, chainId.toString()]
+        );
+
+        await closeOpsGenieAlertWithAlias(`general-rrp-collector-error`, config.opsGenieConfig);
         return;
       } catch (e) {
         const err = e as Error;
-        logging.log('A general error occurred in the RRP events collector', 'ERROR', `${err.message}\n${err.stack}`);
+        console.error(err.message, err.stack);
+
+        await sendToOpsGenieLowLevel(
+          {
+            priority: 'P3',
+            alias: `general-rrp-collector-error-${ethers.utils.keccak256(Buffer.from(err.name))}`,
+            message: 'A general error occurred in the rrp events collector',
+            description: `${err.message}\n${err.stack}`,
+          },
+          config.opsGenieConfig
+        );
 
         return;
       }
@@ -211,48 +330,67 @@ CREATE TABLE IF NOT EXISTS qrng_fulfilments_per_block (
 
 export const sendEventsToDatabase = async (
   db: Client,
-  type: 'requests' | 'fulfilments',
-  chainId: number,
-  eventsWithBlockTimes: UniqueEventsWithBlockTimes
+  type: 'events' | 'transactions',
+  data: Event[] | CompoundTransaction[],
+  config: Config
 ) => {
-  const dbClient = db; // await db.connect();
+  const dbClient = db;
 
-  const promisedDatabaseInserts = await Promise.allSettled(
-    Object.entries(eventsWithBlockTimes).map(async ([key, value]) => {
-      const blockNumber = parseInt(key);
+  const rejections: string[] = [];
 
-      console.log([value.time, chainId, blockNumber, value.events]);
-      await dbClient.query(
-        `INSERT INTO ${type === 'requests' ? 'qrng_requests_per_block' : 'qrng_fulfilments_per_block'}
-        ("time", "chain", "block", "events")
+  for (let i = 0; i < data.length; i++) {
+    const item = data[i];
+
+    if (type === 'events') {
+      const { time, chainId, blockNumber, transactionHash, logIndex, eventName, transactionData, eventData } =
+        item as Event;
+
+      console.log([time, chainId, blockNumber, transactionHash, logIndex, eventName, transactionData, eventData]);
+      await dbClient
+        .query(
+          `INSERT INTO rrp_events
+        ("time", "chain", "block", "transaction_hash", "log_index", "event_name", "transaction_data", "event_data")
         VALUES
-        (to_timestamp($1), $2, $3, $4)
+        (to_timestamp($1), $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT DO NOTHING;
         `,
-        [value.time, chainId, blockNumber, value.events]
-      );
-    })
-  );
-
-  // We're not worried about rejects due to a constraint violation - because such a rejection occurs when we already have the data we want
-  // This can probably be simplified but who has time for boolean logic anyway?
-  const rejections = promisedDatabaseInserts.filter((promise) => {
-    if (promise.status === 'rejected') {
-      if (promise.reason) {
-        return !promise.reason.toString().startsWith('duplicate key value violates unique constraint');
-      }
-
-      return true;
+          [time, chainId, blockNumber, transactionHash, logIndex, eventName, transactionData, eventData]
+        )
+        .catch((e) => rejections.push(JSON.stringify(e)));
     }
-  });
+
+    if (type === 'transactions') {
+      const { time, chainId, blockNumber, transactionHash, transactionData } = item as CompoundTransaction;
+
+      console.log([time, chainId, blockNumber, transactionHash, transactionData]);
+      await dbClient
+        .query(
+          `INSERT INTO rrp_transactions
+        ("time", "chain", "block", "transaction_hash", "transaction_data")
+        VALUES
+        (to_timestamp($1), $2, $3, $4, $5)
+        ON CONFLICT DO NOTHING;
+        `,
+          [time, chainId, blockNumber, transactionHash, transactionData]
+        )
+        .catch((e) => rejections.push(JSON.stringify(e)));
+    }
+  }
 
   if (rejections.length > 0) {
-    logging.log(
-      'A DB INSERT error occurred in the RRP events collector',
-      'ERROR',
-      `Refer to the logs for details. Summary: \n ${JSON.stringify(rejections, null, 2)}`
+    console.error('Something went wrong, rolling back...');
+    console.error(rejections);
+    await sendToOpsGenieLowLevel(
+      {
+        priority: 'P3',
+        alias: `rejection-rrp-collector-error`,
+        message: 'A DB INSERT error occurred in the rrp events collector',
+        description: `Refer to the logs for details. Summary: \n ${JSON.stringify(rejections, null, 2)}`,
+      },
+      config.opsGenieConfig
     );
 
     return;
   }
+  await closeOpsGenieAlertWithAlias(`rejection-rrp-collector-error`, config.opsGenieConfig);
 };

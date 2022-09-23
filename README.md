@@ -1,6 +1,6 @@
 # RRP Events Collector
 
-The RRP events collector is a serverless application which collects Airnode RRP (V1) protocol related events from the
+The RRP events collector is a serverless application which collects Airnode RRP (V0) protocol related events from the
 configured chains and stores them in a Postgres database.
 
 ## Deployment

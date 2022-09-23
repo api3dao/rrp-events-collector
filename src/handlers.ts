@@ -7,7 +7,7 @@ import { Config } from './types';
 import { runRrpCollectionTask } from './rrp-collection';
 
 export const getConfig = (): Config => {
-  const configPath = path.join(__dirname, '../config/walletConfig.json');
+  const configPath = path.join(__dirname, '../config/config.json');
   logging.debugLog('Config Path:', configPath, fs.readdirSync(path.join(__dirname, '..')));
 
   return JSON.parse(fs.readFileSync(configPath).toString('utf-8'));
@@ -19,6 +19,7 @@ export const getConfig = (): Config => {
  * @param _event
  */
 export const rrpCollectionHandler = async (_event: any = {}): Promise<any> => {
+  logging.log('Starting RRP Collector');
   const startedAt = new Date();
   const config = getConfig();
   const db = await initDb(config);
@@ -34,5 +35,5 @@ export const rrpCollectionHandler = async (_event: any = {}): Promise<any> => {
 
   await sendOpsGenieHeartbeat('rrp-collector', config.opsGenieConfig);
   const endedAt = new Date();
-  console.log(`RRP Collection Handler: Run delta: ${(endedAt.getTime() - startedAt.getTime()) / 1000} s`);
+  console.log(`RRP Collection Handler run delta: ${(endedAt.getTime() - startedAt.getTime()) / 1000}s`);
 };

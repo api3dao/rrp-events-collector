@@ -1,19 +1,14 @@
 {
   "chains": {
     "1": {
-      "rpc": "https://eth-mainnet.alchemyapi.io/v2/something",
-      "topUpAmount": "0.2",
-      "lowBalance": "0.1",
-      "globalSponsorLowBalanceWarn": "3"
+      "rpc": "https://eth-mainnet.alchemyapi.io/v2/something"
     },
     "3": {
-      "rpc": "https://eth-ropsten.alchemyapi.io/v2/something",
-      "topUpAmount": "0.16",
-      "lowBalance": "0.15",
-      "globalSponsorLowBalanceWarn": "2"
+      "rpc": "https://eth-ropsten.alchemyapi.io/v2/something"
     }
   },
   "opsGenieConfig": {
+    "apiKey": "opsgenie-api-key",
     "responders": [
       {
         "type": "team",

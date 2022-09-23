@@ -101,7 +101,7 @@ variablesResolutionMode: 20210326
 
 package:
   patterns:
-    - ./config/cConfig.json
+    - ./config/config.json
 
 provider:
   name: aws
